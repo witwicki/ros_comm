@@ -50,6 +50,7 @@ using std::map;
 using std::pair;
 using std::string;
 using std::vector;
+using std::stack;
 using boost::shared_ptr;
 using ros::Exception;
 
@@ -115,10 +116,13 @@ Player::Player(PlayerOptions const& options) :
     pause_for_topics_(options_.pause_topics.size() > 0),
     pause_change_requested_(false),
     requested_pause_state_(false),
+    jumpback_requested_(false),
+    jumpback_in_progress_(false),
     terminal_modified_(false)
 {
   ros::NodeHandle private_node_handle("~");
   pause_service_ = private_node_handle.advertiseService("pause_playback", &Player::pauseCallback, this);
+  jumpback_service_ = private_node_handle.advertiseService("jumpback", &Player::jumpbackCallback, this);
 }
 
 Player::~Player() {
@@ -224,7 +228,7 @@ void Player::publish() {
     options_.advertise_sleep.sleep();
     std::cout << " done." << std::endl;
 
-    std::cout << std::endl << "Hit space to toggle paused, or 's' to step." << std::endl;
+    std::cout << std::endl << "Hit space to toggle paused, or 's' to step, or 'b' to jump back." << std::endl;
 
     // Publish last message from latch topics if the options_.time > 0.0:
     if (options_.time > 0.0) {
@@ -290,7 +294,7 @@ void Player::publish() {
 
         time_translator_.setTimeScale(options_.time_scale);
 
-        start_time_ = view.begin()->getTime();
+        start_time_ = view.begin()->getTime(); // why not view.getBeginTime()?
         time_translator_.setRealStartTime(start_time_);
         bag_length_ = view.getEndTime() - view.getBeginTime();
 
@@ -311,12 +315,77 @@ void Player::publish() {
 
         paused_time_ = now_wt;
 
+        // Create stack of pointers to earlier messages (for jumpback), spaced evenly on each second of recorded bag time
+        std::stack<rosbag::View::const_iterator> jump_back_pointers;
+        double jumpback_destination_time = -1.0;
+        double latest_time_in_stack = -1.0;
+        double period = (1.0 / options_.bag_time_frequency) * 10.0; // 10 times longer than the interval between clock ticks
+
         // Call do-publish for each message
-        for (const MessageInstance& m : view) {
+        rosbag::View::const_iterator message_ptr = view.begin();
+        while(message_ptr != view.end()) {
+            // push a new message onto the stack for jumpback?
+            if (message_ptr->getTime().toSec() >= (latest_time_in_stack + period))
+            {
+                latest_time_in_stack = message_ptr->getTime().toSec();
+                rosbag::View::const_iterator new_message_ptr = message_ptr;
+                jump_back_pointers.push(new_message_ptr);
+                // in the case that we are jumping back under a paused condition, check whethe or not the jumpback time has been reached
+                if(jumpback_in_progress_ && (message_ptr->getTime().toSec() >= jumpback_destination_time))
+                {
+                    jumpback_in_progress_ = false;
+                }
+            }
+            // jump back to an earlier message in the stack?
+            if (jumpback_requested_)
+            {
+                // pop messages from the stack in order to jump back the right amount of time
+                int depth_of_jumpback_position = options_.jumpback_step_size / period;
+                for(int i=0; i<depth_of_jumpback_position; i++)
+                {
+                    if(jump_back_pointers.size() > 1)
+                    {
+                        jump_back_pointers.pop();
+                    }
+                }
+
+                // reset message pointer to the top of the remaining stack
+                rosbag::View::const_iterator jumpback_message_ptr = jump_back_pointers.top();
+                message_ptr = jumpback_message_ptr;
+                // set the jumpback time
+                ros::Time destination_time_of_jump = message_ptr->getTime();
+                jumpback_destination_time = destination_time_of_jump.toSec(); 
+                if(paused_&& jump_back_pointers.size()>2) 
+                {
+                    // but if paused, we should go a little bit deeper into the stack 
+                    //  which will force a few older messages to replay immediately
+                    //  and allow for the most up-to-date state be given to subscribers
+                    jump_back_pointers.pop();
+                    jump_back_pointers.pop();
+                    message_ptr = jump_back_pointers.top();
+                }
+                latest_time_in_stack = message_ptr->getTime().toSec();
+                
+                // roll back time publisher
+                time_publisher_.setTime(destination_time_of_jump);
+                
+                // correct time translation
+                ros::Time translated = time_translator_.translate(destination_time_of_jump);
+                ros::WallTime translated_walltime = ros::WallTime(translated.sec, translated.nsec);
+                ros::WallDuration shift = ros::WallTime::now() - translated_walltime;
+                time_translator_.shift(ros::Duration(shift.sec, shift.nsec));
+
+                // now the jumpback will execute
+                std::cout.setf(std::ios::fixed);
+                std::cout << "--- JUMPING BACK to message with time = " << message_ptr->getTime() << " ---" << std::endl << std::flush;
+                jumpback_requested_ = false;
+                jumpback_in_progress_ = true;
+            }
+            // publish
+            doPublish(*message_ptr);
+            message_ptr++;
             if (!node_handle_.ok())
                 break;
-
-            doPublish(m);
         }
 
         if (options_.keep_alive)
@@ -417,6 +486,14 @@ bool Player::pauseCallback(std_srvs::SetBool::Request &req, std_srvs::SetBool::R
   return true;
 }
 
+bool Player::jumpbackCallback(std_srvs::SetBool::Request &req, std_srvs::SetBool::Response &res)
+{
+  std::cout << "Received jumpback request " << req.data;
+  res.message = std::string("Jumping back");
+  jumpback_requested_ = true;
+  return true;
+}
+
 void Player::processPause(const bool paused, ros::WallTime &horizon)
 {
   paused_ = paused;
@@ -436,6 +513,12 @@ void Player::processPause(const bool paused, ros::WallTime &horizon)
     horizon += shift;
     time_publisher_.setWCHorizon(horizon);
   }
+}
+
+void Player::processJumpback()
+{
+  jumpback_requested_ = true;
+  jumpback_in_progress_ = false;
 }
 
 void Player::waitForSubscribers() const
@@ -490,8 +573,8 @@ void Player::doPublish(MessageInstance const& m) {
     // Update subscribers.
     ros::spinOnce();
 
-    // If immediate specified, play immediately
-    if (options_.at_once) {
+    // If immediate specified in option (or we are in the process of performing a jumpback), play immediately
+    if (options_.at_once || jumpback_in_progress_) {
         time_publisher_.stepClock();
         pub_iter->second.publish(m);
         printTime();
@@ -552,6 +635,18 @@ void Player::doPublish(MessageInstance const& m) {
             case ' ':
                 processPause(!paused_, horizon);
                 break;
+            case 'b':
+                processJumpback();
+                // if we are paused, break out of here so that we can jumpback
+                if(paused_)
+                {
+                    // ensure that time translation accounts for time paused
+                    processPause(false, horizon);
+                    paused_ = true;
+                    return;
+                }
+                break;
+                // throw Exception("stefan's exception.");
             case 's':
                 if (paused_) {
                     time_publisher_.stepClock();

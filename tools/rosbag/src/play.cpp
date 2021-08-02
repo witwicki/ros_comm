@@ -65,6 +65,7 @@ rosbag::PlayerOptions parseOptions(int argc, char** argv) {
       ("wait-for-subscribers", "wait for at least one subscriber on each topic before publishing")
       ("rate-control-topic", po::value<std::string>(), "watch the given topic, and if the last publish was more than <rate-control-max-delay> ago, wait until the topic publishes again to continue playback")
       ("rate-control-max-delay", po::value<float>()->default_value(1.0f), "maximum time difference from <rate-control-topic> before pausing")
+      ("jumpback-stepsize", po::value<float>()->default_value(1.0f), "the (approximate) time step for jumping back")
       ;
 
     po::positional_options_description p;
@@ -148,6 +149,9 @@ rosbag::PlayerOptions parseOptions(int argc, char** argv) {
 
     if (vm.count("rate-control-max-delay"))
       opts.rate_control_max_delay = vm["rate-control-max-delay"].as<float>();
+
+    if (vm.count("jumpback-stepsize"))
+      opts.jumpback_step_size = vm["jumpback-stepsize"].as<float>();
 
     if (vm.count("bags"))
     {

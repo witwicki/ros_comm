@@ -97,6 +97,7 @@ struct ROSBAG_DECL PlayerOptions
     std::string rate_control_topic;
     float    rate_control_max_delay;
     ros::Duration skip_empty;
+    double   jumpback_step_size;
 
     std::vector<std::string> bags;
     std::vector<std::string> topics;
@@ -190,8 +191,11 @@ private:
     void printTime();
 
     bool pauseCallback(std_srvs::SetBool::Request &req, std_srvs::SetBool::Response &res);
+    bool jumpbackCallback(std_srvs::SetBool::Request &req, std_srvs::SetBool::Response &res);
 
     void processPause(const bool paused, ros::WallTime &horizon);
+
+    void processJumpback();
 
     void waitForSubscribers() const;
 
@@ -203,6 +207,7 @@ private:
     ros::NodeHandle node_handle_;
 
     ros::ServiceServer pause_service_;
+    ros::ServiceServer jumpback_service_;
 
     bool paused_;
     bool delayed_;
@@ -212,6 +217,9 @@ private:
     bool pause_change_requested_;
 
     bool requested_pause_state_;
+
+    bool jumpback_requested_;
+    bool jumpback_in_progress_;
 
     ros::Subscriber rate_control_sub_;
     ros::Time last_rate_control_;
